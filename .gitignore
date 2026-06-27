@@ -1,0 +1,75 @@
+# ROS 2 build outputs
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+log/
+
+# Build outputs inside vendored/source packages
+**/build/
+**/cmake-build-*/
+ros2_ws/src/FAST-LIVO2/Log/
+
+# Colcon and CMake generated files
+**/CMakeCache.txt
+**/CMakeFiles/
+**/cmake_install.cmake
+**/Makefile
+**/compile_commands.json
+
+# Nested repository metadata from vendored source drops
+**/.git/
+
+# Runtime data: keep directory layout with .gitkeep, ignore large payloads
+data/bags/*
+data/pcd/*
+data/maps/*
+data/calib/*
+!data/bags/.gitkeep
+!data/pcd/.gitkeep
+!data/maps/.gitkeep
+!data/calib/.gitkeep
+
+# Common rosbag and point-cloud/map artifacts
+*.bag
+*.db3
+*.mcap
+*.pcd
+*.ply
+*.las
+*.laz
+*.bt
+*.pgm
+*.pgm.yaml
+
+# Large media and compressed data captures
+data/**/*.mp4
+data/**/*.avi
+data/**/*.mov
+data/**/*.mkv
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.tif
+data/**/*.tiff
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# Python / editor noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+
+# Runtime logs
+logs/**/*.log
+*.log
