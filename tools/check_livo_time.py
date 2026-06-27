@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import Image, Imu
 from livox_ros_driver2.msg import CustomMsg
@@ -15,9 +16,21 @@ class CheckTime(Node):
         self.imu_t = None
         self.img_t = None
 
-        self.create_subscription(CustomMsg, '/livox/lidar', self.lidar_cb, 10)
-        self.create_subscription(Imu, '/livox/imu', self.imu_cb, 100)
-        self.create_subscription(Image, '/camera/image', self.img_cb, 10)
+        self.declare_parameter('lidar_topic', '/livox/lidar')
+        self.declare_parameter('imu_topic', '/livox/imu')
+        self.declare_parameter('image_topic', '/left_camera/image')
+
+        lidar_topic = self.get_parameter('lidar_topic').value
+        imu_topic = self.get_parameter('imu_topic').value
+        image_topic = self.get_parameter('image_topic').value
+
+        self.get_logger().info(
+            f'checking topics: lidar={lidar_topic}, imu={imu_topic}, image={image_topic}'
+        )
+
+        self.create_subscription(CustomMsg, lidar_topic, self.lidar_cb, 10)
+        self.create_subscription(Imu, imu_topic, self.imu_cb, 100)
+        self.create_subscription(Image, image_topic, self.img_cb, 10)
 
         self.create_timer(1.0, self.print_status)
 
@@ -46,7 +59,14 @@ class CheckTime(Node):
 def main():
     rclpy.init()
     node = CheckTime()
-    rclpy.spin(node)
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

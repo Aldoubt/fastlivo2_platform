@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>fastlivo2_bringup</name>
+  <version>0.1.0</version>
+  <description>Bringup launch files for the FAST-LIVO2 Jetson sensor platform.</description>
+  <maintainer email="2586049954@qq.com">Xuan Yang</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>hik_camera_ros2_driver</exec_depend>
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

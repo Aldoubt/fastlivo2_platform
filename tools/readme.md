@@ -93,7 +93,7 @@ Jetson 主要负责：
 - 仓库中已包含 FAST-LIVO2 ROS 2 版本代码。
 - 仓库中已包含 FAST-LIVO2 所需的 `vikit`、`Sophus` 等依赖。
 - 初步验证过传感器话题和数据发布正常。
-- 已编写 `tools/check_livo_time.py`，可用于查看 `/livox/lidar`、`/livox/imu`、`/camera/image` 三类话题的时间差。
+- 已编写 `tools/check_livo_time.py`，可用于查看 `/livox/lidar`、`/livox/imu`、`/left_camera/image` 三类话题的时间差。
 
 ### 5.2 需要实测确认
 
@@ -123,8 +123,10 @@ Jetson 主要负责：
 
 待完成：
 
-- 运行 `tools/check_livo_time.py`，记录 `img-lidar`、`imu-lidar` 的时间差。
-- 检查 `/livox/lidar`、`/livox/imu`、`/camera/image` 是否与实际驱动发布话题一致。
+- 先运行 `tools/check_livo_time.py` 做在线冒烟检查，确认三类话题都有数据。
+- 录制一段包含雷达、IMU、相机的 rosbag2。
+- 再运行 `tools/check_bag_time.py` 对 rosbag2 做离线时间戳统计，记录 `img-lidar`、`img-imu` 的均值、P95 和最大绝对差值。
+- 检查 `/livox/lidar`、`/livox/imu`、`/left_camera/image` 是否与实际驱动发布话题一致。
 - 对比 FAST-LIVO2 配置文件中的订阅话题、frame_id、时间戳设置。
 
 验收标准：
@@ -149,8 +151,8 @@ Jetson 主要负责：
 ```bash
 /livox/lidar
 /livox/imu
-/camera/image
-/camera/camera_info
+/left_camera/image
+/left_camera/camera_info
 /tf
 /tf_static
 ```
@@ -229,37 +231,72 @@ source ros2_ws/install/setup.bash
 ros2 launch hik_camera_ros2_driver hik_camera_launch.py
 ```
 
-### 7.5 检查时间戳差异
+### 7.5 一键启动雷达、相机与 RViz
+
+默认用于现场直观看数据：Livox 以 `PointCloud2` 格式发布 `/livox/lidar`，RViz 可直接显示点云；海康相机发布 `/left_camera/image`。
+
+```bash
+source ros2_ws/install/setup.bash
+ros2 launch fastlivo2_bringup sensors_rviz.launch.py
+```
+
+如果后续要给 FAST-LIVO2 使用 Livox `CustomMsg`，可切换雷达输出格式：
+
+```bash
+source ros2_ws/install/setup.bash
+ros2 launch fastlivo2_bringup sensors_rviz.launch.py lidar_xfer_format:=1
+```
+
+注意：`lidar_xfer_format:=1` 更适合 FAST-LIVO2 和时间戳检查，但 RViz 不能直接显示 Livox `CustomMsg` 点云；直观看点云时使用默认的 `lidar_xfer_format:=0`。
+
+### 7.6 检查时间戳差异
+
+在线检查只用于确认话题是否存在、时间戳是否明显异常；正式验收以 rosbag2 离线统计为准。
 
 ```bash
 source ros2_ws/install/setup.bash
 python3 tools/check_livo_time.py
 ```
 
-### 7.6 启动 FAST-LIVO2
+### 7.7 启动 FAST-LIVO2
 
 ```bash
 source ros2_ws/install/setup.bash
 ros2 launch fast_livo mapping_aviz.launch.py use_rviz:=True
 ```
 
-### 7.7 录制最小 rosbag2
+### 7.8 录制最小 rosbag2
 
 `ros2 bag record` 默认会把数据写入当前终端所在目录。为了避免 rosbag 散落在工作空间或源码目录中，本项目统一使用 `-o data/bags/<bag_name>` 指定输出目录。
 
 ```bash
+cd /home/jetson/fastlivo2_platform
 mkdir -p data/bags
 ros2 bag record \
   -o data/bags/livo_$(date +%Y%m%d_%H%M%S) \
   /livox/lidar \
   /livox/imu \
-  /camera/image \
-  /camera/camera_info \
+  /left_camera/image \
+  /left_camera/camera_info \
   /tf \
   /tf_static
 ```
 
 录制结果会保存在仓库根目录的 `data/bags/` 下；在当前设备上对应 `/home/jetson/fastlivo2_platform/data/bags/`。
+如果在 `ros2_ws/` 目录里执行同样的相对路径命令，bag 会落到 `ros2_ws/data/bags/`，后续建议移动回仓库根目录的 `data/bags/`。
+
+### 7.9 离线分析 rosbag2 时间戳
+
+录制完成后，用 rosbag2 目录作为输入：
+
+```bash
+source ros2_ws/install/setup.bash
+python3 tools/check_bag_time.py data/bags/<bag_name>
+```
+
+这里的 `<bag_name>` 是 `ros2 bag record -o` 生成的目录名，例如 `data/bags/livo_20260627_171641`；不要手动写成 `livo_20260627_171641_0.db3`。如果确实传入 bag 目录中的 `.db3` 文件，脚本会自动改用它的父目录。
+
+脚本会以每个图像帧为参考，分别寻找最近的 LiDAR 帧和 IMU 帧，并输出 `mean`、`mean_abs`、`p95_abs`、`max_abs`。正式判断时间同步质量时，以这组离线统计结果为准。
 
 说明：
 
