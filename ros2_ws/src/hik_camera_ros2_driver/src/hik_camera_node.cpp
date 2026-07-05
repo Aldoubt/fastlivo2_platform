@@ -1,4 +1,16 @@
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "MvCameraControl.h"
 #include "camera_info_manager/camera_info_manager.hpp"
@@ -8,6 +20,16 @@
 
 namespace hik_camera_ros2_driver
 {
+namespace
+{
+std::string sdkStatusToHex(int status)
+{
+  std::ostringstream stream;
+  stream << "0x" << std::hex << std::uppercase << static_cast<uint32_t>(status);
+  return stream.str();
+}
+}  // namespace
+
 class HikCameraRos2DriverNode : public rclcpp::Node
 {
 public:
@@ -16,9 +38,11 @@ public:
   {
     RCLCPP_INFO(this->get_logger(), "Starting HikCameraRos2DriverNode!");
 
-    initializeCamera();
-    declareParameters();
-    startCamera();
+    if (!initializeCamera() || !declareAndApplyParameters() || !startCamera()) {
+      RCLCPP_FATAL(this->get_logger(), "Camera initialization failed; grabbing thread will not start.");
+      rclcpp::shutdown();
+      return;
+    }
 
     params_callback_handle_ = this->add_on_set_parameters_callback(
       std::bind(&HikCameraRos2DriverNode::dynamicParametersCallback, this, std::placeholders::_1));
@@ -28,13 +52,27 @@ public:
 
   ~HikCameraRos2DriverNode() override
   {
+    running_ = false;
     if (capture_thread_.joinable()) {
       capture_thread_.join();
     }
     if (camera_handle_) {
-      MV_CC_StopGrabbing(camera_handle_);
-      MV_CC_CloseDevice(camera_handle_);
-      MV_CC_DestroyHandle(&camera_handle_);
+      std::lock_guard<std::mutex> lock(sdk_mutex_);
+      int status = MV_CC_StopGrabbing(camera_handle_);
+      if (status != MV_OK) {
+        RCLCPP_DEBUG(this->get_logger(), "Stop grabbing during shutdown returned %s",
+          sdkStatusToHex(status).c_str());
+      }
+      status = MV_CC_CloseDevice(camera_handle_);
+      if (status != MV_OK) {
+        RCLCPP_WARN(this->get_logger(), "Failed to close camera device, status = %s",
+          sdkStatusToHex(status).c_str());
+      }
+      status = MV_CC_DestroyHandle(&camera_handle_);
+      if (status != MV_OK) {
+        RCLCPP_WARN(this->get_logger(), "Failed to destroy camera handle, status = %s",
+          sdkStatusToHex(status).c_str());
+      }
     }
     RCLCPP_INFO(this->get_logger(), "HikCameraRos2DriverNode destroyed!");
   }
@@ -43,8 +81,8 @@ private:
   bool initializeCamera()
   {
     MV_CC_DEVICE_INFO_LIST device_list;
+    std::memset(&device_list, 0, sizeof(device_list));
 
-    // enum device
     while (rclcpp::ok()) {
       n_ret_ = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
       if (n_ret_ != MV_OK) {
@@ -58,28 +96,32 @@ private:
         break;
       }
     }
+    if (!rclcpp::ok()) {
+      return false;
+    }
 
     n_ret_ = MV_CC_CreateHandle(&camera_handle_, device_list.pDeviceInfo[0]);
     if (n_ret_ != MV_OK) {
-      RCLCPP_ERROR(this->get_logger(), "Failed to create camera handle!");
+      RCLCPP_ERROR(this->get_logger(), "Failed to create camera handle, status = %s",
+        sdkStatusToHex(n_ret_).c_str());
       return false;
     }
 
     n_ret_ = MV_CC_OpenDevice(camera_handle_);
     if (n_ret_ != MV_OK) {
-      RCLCPP_ERROR(this->get_logger(), "Failed to open camera device!");
+      RCLCPP_ERROR(this->get_logger(), "Failed to open camera device, status = %s",
+        sdkStatusToHex(n_ret_).c_str());
       return false;
     }
 
-    // Get camera information
     n_ret_ = MV_CC_GetImageInfo(camera_handle_, &img_info_);
     if (n_ret_ != MV_OK) {
-      RCLCPP_ERROR(this->get_logger(), "Failed to get camera image info!");
+      RCLCPP_ERROR(this->get_logger(), "Failed to get camera image info, status = %s",
+        sdkStatusToHex(n_ret_).c_str());
       return false;
     }
 
-    // Init convert param
-    image_msg_.data.reserve(img_info_.nHeightMax * img_info_.nWidthMax * 3);
+    image_msg_.data.resize(img_info_.nHeightMax * img_info_.nWidthMax * 3);
     convert_param_.nWidth = img_info_.nWidthValue;
     convert_param_.nHeight = img_info_.nHeightValue;
     convert_param_.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
@@ -87,89 +129,108 @@ private:
     return true;
   }
 
-  void declareParameters()
+  bool declareAndApplyParameters()
   {
-    rcl_interfaces::msg::ParameterDescriptor param_desc;
-    MVCC_FLOATVALUE f_value;
-    param_desc.integer_range.resize(1);
-    param_desc.integer_range[0].step = 1;
-
-    // Acquisition frame rate
-    param_desc.description = "Acquisition frame rate in Hz";
-    MV_CC_GetFloatValue(camera_handle_, "AcquisitionFrameRate", &f_value);
-    param_desc.integer_range[0].from_value = f_value.fMin;
-    param_desc.integer_range[0].to_value = f_value.fMax;
-    double acquisition_frame_rate =
-      this->declare_parameter("acquisition_frame_rate", 165.0, param_desc);
-    MV_CC_SetBoolValue(camera_handle_, "AcquisitionFrameRateEnable", true);
-    MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", acquisition_frame_rate);
-    RCLCPP_INFO(this->get_logger(), "Acquisition frame rate: %f", acquisition_frame_rate);
-
-    // Exposure time
-    param_desc.description = "Exposure time in microseconds";
-    MV_CC_GetFloatValue(camera_handle_, "ExposureTime", &f_value);
-    param_desc.integer_range[0].from_value = f_value.fMin;
-    param_desc.integer_range[0].to_value = f_value.fMax;
-    double exposure_time = this->declare_parameter("exposure_time", 5000, param_desc);
-    MV_CC_SetFloatValue(camera_handle_, "ExposureTime", exposure_time);
-    RCLCPP_INFO(this->get_logger(), "Exposure time: %f", exposure_time);
-
-    // Gain
-    param_desc.description = "Gain";
-    MV_CC_GetFloatValue(camera_handle_, "Gain", &f_value);
-    param_desc.integer_range[0].from_value = f_value.fMin;
-    param_desc.integer_range[0].to_value = f_value.fMax;
-    double gain = this->declare_parameter("gain", f_value.fCurValue, param_desc);
-    MV_CC_SetFloatValue(camera_handle_, "Gain", gain);
-    RCLCPP_INFO(this->get_logger(), "Gain: %f", gain);
-
-    int status;
-
-    // ADC Bit Depth
-    param_desc.description = "ADC Bit Depth";
-    param_desc.additional_constraints = "Supported values: Bits_8, Bits_12";
-    std::string adc_bit_depth = this->declare_parameter("adc_bit_depth", "Bits_8", param_desc);
-    status = MV_CC_SetEnumValueByString(camera_handle_, "ADCBitDepth", adc_bit_depth.c_str());
-    if (status == MV_OK) {
-      RCLCPP_INFO(this->get_logger(), "ADC Bit Depth set to %s", adc_bit_depth.c_str());
-    } else {
-      RCLCPP_ERROR(this->get_logger(), "Failed to set ADC Bit Depth, status = %d", status);
-    }
-
-    // Pixel format
-    param_desc.description = "Pixel Format";
-    std::string pixel_format = this->declare_parameter("pixel_format", "RGB8Packed", param_desc);
-    status = MV_CC_SetEnumValueByString(camera_handle_, "PixelFormat", pixel_format.c_str());
-    if (status == MV_OK) {
-      RCLCPP_INFO(this->get_logger(), "Pixel Format set to %s", pixel_format.c_str());
-    } else {
-      RCLCPP_ERROR(this->get_logger(), "Failed to set Pixel Format, status = %d", status);
-    }
-  }
-
-  void startCamera()
-  {
-    bool use_sensor_data_qos = this->declare_parameter("use_sensor_data_qos", true);
+    camera_info_url_ = this->declare_parameter(
+      "camera_info_url", "package://hik_camera_ros2_driver/config/camera_info.yaml");
+    pixel_format_ = this->declare_parameter("pixel_format", "RGB8Packed");
+    adc_bit_depth_ = this->declare_parameter("adc_bit_depth", "Bits_8");
+    use_sensor_data_qos_ = this->declare_parameter("use_sensor_data_qos", true);
     camera_name_ = this->declare_parameter("camera_name", "camera");
     frame_id_ = this->declare_parameter("frame_id", camera_name_ + "_optical_frame");
     camera_topic_ = this->declare_parameter("camera_topic", camera_name_ + "/image");
 
-    auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
+    trigger_mode_ = this->declare_parameter("trigger_mode", false);
+    trigger_source_ = this->declare_parameter("trigger_source", "Line0");
+    trigger_activation_ = this->declare_parameter("trigger_activation", "RisingEdge");
+    trigger_delay_us_ = this->declare_parameter("trigger_delay_us", 0.0);
+
+    acquisition_frame_rate_enable_ =
+      this->declare_parameter("acquisition_frame_rate_enable", true);
+    acquisition_frame_rate_ = this->declare_parameter("acquisition_frame_rate", 165.0);
+
+    exposure_auto_ = this->declare_parameter("exposure_auto", "Off");
+    exposure_time_ = this->declare_parameter("exposure_time", 5000.0);
+    gain_auto_ = this->declare_parameter("gain_auto", "Off");
+    gain_ = this->declare_parameter("gain", 15.0);
+
+    if (!validateEnum("exposure_auto", exposure_auto_, auto_modes_) ||
+      !validateEnum("gain_auto", gain_auto_, auto_modes_) ||
+      !validateEnum("trigger_source", trigger_source_, trigger_sources_) ||
+      !validateEnum("trigger_activation", trigger_activation_, trigger_activations_))
+    {
+      return false;
+    }
+
+    return applyCameraConfiguration();
+  }
+
+  bool applyCameraConfiguration()
+  {
+    bool ok = true;
+
+    ok = setEnumStringFeature("ADCBitDepth", adc_bit_depth_, true) && ok;
+    ok = setEnumStringFeature("PixelFormat", pixel_format_, true) && ok;
+
+    ok = setEnumStringFeature("ExposureAuto", exposure_auto_, true) && ok;
+    if (exposure_auto_ == "Off") {
+      ok = setFloatFeatureChecked("ExposureTime", exposure_time_, true) && ok;
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+        "Exposure auto is %s; fixed ExposureTime request %.3f us is kept as standby only.",
+        exposure_auto_.c_str(), exposure_time_);
+    }
+
+    ok = setEnumStringFeature("GainAuto", gain_auto_, true) && ok;
+    if (gain_auto_ == "Off") {
+      ok = setFloatFeatureChecked("Gain", gain_, true) && ok;
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+        "Gain auto is %s; fixed Gain request %.3f is kept as standby only.",
+        gain_auto_.c_str(), gain_);
+    }
+
+    if (trigger_mode_) {
+      ok = setBoolFeature("AcquisitionFrameRateEnable", false, true) && ok;
+      ok = setEnumStringFeature("TriggerMode", "Off", true) && ok;
+      ok = setEnumStringFeature("TriggerSource", trigger_source_, true) && ok;
+      ok = setEnumStringFeature("TriggerActivation", trigger_activation_, true) && ok;
+      ok = setFloatFeatureChecked("TriggerDelay", trigger_delay_us_, false) && ok;
+      ok = setEnumStringFeature("TriggerMode", "On", true) && ok;
+    } else {
+      ok = setEnumStringFeature("TriggerMode", "Off", true) && ok;
+      ok = setBoolFeature("AcquisitionFrameRateEnable", acquisition_frame_rate_enable_, true) && ok;
+      if (acquisition_frame_rate_enable_) {
+        ok = setFloatFeatureChecked("AcquisitionFrameRate", acquisition_frame_rate_, true) && ok;
+      }
+    }
+
+    logConfigurationSummary();
+    return ok;
+  }
+
+  bool startCamera()
+  {
+    auto qos = use_sensor_data_qos_ ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
     camera_pub_ = image_transport::create_camera_publisher(this, camera_topic_, qos);
 
-    MV_CC_StartGrabbing(camera_handle_);
-
-    // Load camera info
     camera_info_manager_ =
       std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
-    auto camera_info_url = this->declare_parameter(
-      "camera_info_url", "package://hik_camera_ros2_driver/config/camera_info.yaml");
-    if (camera_info_manager_->validateURL(camera_info_url)) {
-      camera_info_manager_->loadCameraInfo(camera_info_url);
+    if (camera_info_manager_->validateURL(camera_info_url_)) {
+      camera_info_manager_->loadCameraInfo(camera_info_url_);
       camera_info_msg_ = camera_info_manager_->getCameraInfo();
     } else {
-      RCLCPP_WARN(this->get_logger(), "Invalid camera info URL: %s", camera_info_url.c_str());
+      RCLCPP_WARN(this->get_logger(), "Invalid camera info URL: %s", camera_info_url_.c_str());
     }
+
+    n_ret_ = MV_CC_StartGrabbing(camera_handle_);
+    if (n_ret_ != MV_OK) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to start grabbing, status = %s",
+        sdkStatusToHex(n_ret_).c_str());
+      return false;
+    }
+
+    return true;
   }
 
   void captureLoop()
@@ -180,42 +241,74 @@ private:
     image_msg_.header.frame_id = frame_id_;
     image_msg_.encoding = "rgb8";
 
-    while (rclcpp::ok()) {
-      n_ret_ = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
+    while (rclcpp::ok() && running_) {
+      {
+        std::lock_guard<std::mutex> lock(sdk_mutex_);
+        n_ret_ = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
+      }
       if (MV_OK == n_ret_) {
+        image_msg_.height = out_frame.stFrameInfo.nHeight;
+        image_msg_.width = out_frame.stFrameInfo.nWidth;
+        image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
+        image_msg_.data.resize(image_msg_.width * image_msg_.height * 3);
+
+        convert_param_.nWidth = out_frame.stFrameInfo.nWidth;
+        convert_param_.nHeight = out_frame.stFrameInfo.nHeight;
         convert_param_.pDstBuffer = image_msg_.data.data();
         convert_param_.nDstBufferSize = image_msg_.data.size();
         convert_param_.pSrcData = out_frame.pBufAddr;
         convert_param_.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
         convert_param_.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
 
-        MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
+        int convert_status = MV_OK;
+        {
+          std::lock_guard<std::mutex> lock(sdk_mutex_);
+          convert_status = MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
+        }
+        if (convert_status != MV_OK) {
+          RCLCPP_WARN(this->get_logger(), "MV_CC_ConvertPixelType failed, status = %s",
+            sdkStatusToHex(convert_status).c_str());
+          freeImageBuffer(out_frame);
+          continue;
+        }
 
         image_msg_.header.stamp = this->now();
-        image_msg_.height = out_frame.stFrameInfo.nHeight;
-        image_msg_.width = out_frame.stFrameInfo.nWidth;
-        image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
-        image_msg_.data.resize(image_msg_.width * image_msg_.height * 3);
-
         camera_info_msg_.header = image_msg_.header;
         camera_pub_.publish(image_msg_, camera_info_msg_);
+        fail_count_ = 0;
 
-        MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
+        freeImageBuffer(out_frame);
 
         static auto last_log_time = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 3) {
           MVCC_FLOATVALUE f_value;
-          MV_CC_GetFloatValue(camera_handle_, "ResultingFrameRate", &f_value);
-          RCLCPP_DEBUG(this->get_logger(), "ResultingFrameRate: %f Hz", f_value.fCurValue);
+          int status = MV_OK;
+          {
+            std::lock_guard<std::mutex> lock(sdk_mutex_);
+            status = MV_CC_GetFloatValue(camera_handle_, "ResultingFrameRate", &f_value);
+          }
+          if (status == MV_OK) {
+            RCLCPP_DEBUG(this->get_logger(), "ResultingFrameRate: %f Hz", f_value.fCurValue);
+          }
           last_log_time = now;
         }
 
       } else {
-        RCLCPP_WARN(this->get_logger(), "Get buffer failed! nRet: [%x]", n_ret_);
-        MV_CC_StopGrabbing(camera_handle_);
-        MV_CC_StartGrabbing(camera_handle_);
-        fail_count_++;
+        const auto status = static_cast<unsigned int>(n_ret_);
+        if (status == MV_E_NODATA || status == MV_E_GC_TIMEOUT) {
+          RCLCPP_DEBUG(this->get_logger(),
+            "No image received before timeout, status = %s", sdkStatusToHex(n_ret_).c_str());
+          continue;
+        }
+
+        RCLCPP_WARN(this->get_logger(), "Get buffer failed, status = %s",
+          sdkStatusToHex(n_ret_).c_str());
+        if (restartGrabbing()) {
+          fail_count_ = 0;
+        } else {
+          fail_count_++;
+        }
       }
 
       if (fail_count_ > 5) {
@@ -232,40 +325,204 @@ private:
     result.successful = true;
 
     for (const auto & param : parameters) {
-      const auto & type = param.get_type();
       const auto & name = param.get_name();
-      int status = MV_OK;
 
-      if (type == rclcpp::ParameterType::PARAMETER_DOUBLE) {
-        if (name == "gain") {
-          status = MV_CC_SetFloatValue(camera_handle_, "Gain", param.as_double());
-        } else {
+      if (name == "exposure_time") {
+        if (exposure_auto_ != "Off") {
           result.successful = false;
-          result.reason = "Unknown parameter: " + name;
+          result.reason = "exposure_time can only be changed when exposure_auto is Off";
           continue;
         }
-      } else if (type == rclcpp::ParameterType::PARAMETER_INTEGER) {
-        if (name == "exposure_time") {
-          status = MV_CC_SetFloatValue(camera_handle_, "ExposureTime", param.as_int());
-        } else {
-          result.successful = false;
-          result.reason = "Unknown parameter: " + name;
+        double value = parameterAsDouble(param, result);
+        if (!result.successful) {
           continue;
         }
+        if (!setFloatFeatureChecked("ExposureTime", value, true)) {
+          result.successful = false;
+          result.reason = "Failed to set exposure_time";
+          continue;
+        }
+        exposure_time_ = value;
+      } else if (name == "gain") {
+        if (gain_auto_ != "Off") {
+          result.successful = false;
+          result.reason = "gain can only be changed when gain_auto is Off";
+          continue;
+        }
+        double value = parameterAsDouble(param, result);
+        if (!result.successful) {
+          continue;
+        }
+        if (!setFloatFeatureChecked("Gain", value, true)) {
+          result.successful = false;
+          result.reason = "Failed to set gain";
+          continue;
+        }
+        gain_ = value;
       } else {
         result.successful = false;
-        result.reason = "Unsupported parameter type for: " + name;
-        continue;
-      }
-
-      if (status != MV_OK) {
-        result.successful = false;
-        result.reason = "Failed to set " + name + ", status = " + std::to_string(status);
+        result.reason = name + " is startup-only in this driver";
       }
     }
 
     return result;
   }
+
+  double parameterAsDouble(
+    const rclcpp::Parameter & param, rcl_interfaces::msg::SetParametersResult & result)
+  {
+    if (param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE) {
+      return param.as_double();
+    }
+    if (param.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER) {
+      return static_cast<double>(param.as_int());
+    }
+    result.successful = false;
+    result.reason = param.get_name() + " must be a number";
+    return 0.0;
+  }
+
+  bool validateEnum(
+    const std::string & parameter_name, const std::string & value,
+    const std::map<std::string, std::string> & allowed_values)
+  {
+    if (allowed_values.find(value) != allowed_values.end()) {
+      return true;
+    }
+
+    RCLCPP_ERROR(this->get_logger(), "Invalid %s value '%s'", parameter_name.c_str(), value.c_str());
+    return false;
+  }
+
+  bool setBoolFeature(const std::string & feature, bool value, bool required)
+  {
+    std::lock_guard<std::mutex> lock(sdk_mutex_);
+    int status = MV_CC_SetBoolValue(camera_handle_, feature.c_str(), value);
+    if (status == MV_OK) {
+      RCLCPP_INFO(this->get_logger(), "%s set to %s", feature.c_str(), value ? "true" : "false");
+      return true;
+    }
+    logSetFailure(feature, value ? "true" : "false", status, required);
+    return !required;
+  }
+
+  bool setEnumStringFeature(const std::string & feature, const std::string & value, bool required)
+  {
+    std::lock_guard<std::mutex> lock(sdk_mutex_);
+    int status = MV_CC_SetEnumValueByString(camera_handle_, feature.c_str(), value.c_str());
+    if (status == MV_OK) {
+      RCLCPP_INFO(this->get_logger(), "%s set to %s", feature.c_str(), value.c_str());
+      return true;
+    }
+    logSetFailure(feature, value, status, required);
+    return !required;
+  }
+
+  bool setFloatFeatureChecked(const std::string & feature, double value, bool required)
+  {
+    std::lock_guard<std::mutex> lock(sdk_mutex_);
+    MVCC_FLOATVALUE float_value;
+    int status = MV_CC_GetFloatValue(camera_handle_, feature.c_str(), &float_value);
+    if (status != MV_OK) {
+      logSetFailure(feature, std::to_string(value), status, required);
+      return !required;
+    }
+
+    if (value < float_value.fMin || value > float_value.fMax) {
+      RCLCPP_ERROR(this->get_logger(),
+        "%s value %.6f is outside camera range [%.6f, %.6f]",
+        feature.c_str(), value, float_value.fMin, float_value.fMax);
+      return !required;
+    }
+
+    status = MV_CC_SetFloatValue(camera_handle_, feature.c_str(), static_cast<float>(value));
+    if (status == MV_OK) {
+      MVCC_FLOATVALUE actual_value;
+      if (MV_CC_GetFloatValue(camera_handle_, feature.c_str(), &actual_value) == MV_OK) {
+        RCLCPP_INFO(this->get_logger(), "%s requested %.6f, actual %.6f",
+          feature.c_str(), value, actual_value.fCurValue);
+      } else {
+        RCLCPP_INFO(this->get_logger(), "%s set to %.6f", feature.c_str(), value);
+      }
+      return true;
+    }
+
+    logSetFailure(feature, std::to_string(value), status, required);
+    return !required;
+  }
+
+  void logSetFailure(
+    const std::string & feature, const std::string & value, int status, bool required)
+  {
+    if (required) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to set %s to %s, SDK status = %s",
+        feature.c_str(), value.c_str(), sdkStatusToHex(status).c_str());
+    } else {
+      RCLCPP_WARN(this->get_logger(), "Optional feature %s could not be set to %s, SDK status = %s",
+        feature.c_str(), value.c_str(), sdkStatusToHex(status).c_str());
+    }
+  }
+
+  void logConfigurationSummary()
+  {
+    RCLCPP_INFO(this->get_logger(), "Camera acquisition mode: %s",
+      trigger_mode_ ? "ExternalTrigger" : "FreeRun");
+    RCLCPP_INFO(this->get_logger(), "Trigger source: %s", trigger_source_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Trigger activation: %s", trigger_activation_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Trigger delay: %.3f us", trigger_delay_us_);
+    RCLCPP_INFO(this->get_logger(), "Acquisition frame rate enabled: %s",
+      trigger_mode_ ? "false" : (acquisition_frame_rate_enable_ ? "true" : "false"));
+    RCLCPP_INFO(this->get_logger(), "Acquisition frame rate: %.3f Hz", acquisition_frame_rate_);
+    RCLCPP_INFO(this->get_logger(), "Exposure auto: %s", exposure_auto_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Exposure time: %.3f us", exposure_time_);
+    RCLCPP_INFO(this->get_logger(), "Gain auto: %s", gain_auto_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Gain: %.3f", gain_);
+    RCLCPP_INFO(this->get_logger(), "Pixel format: %s", pixel_format_.c_str());
+    RCLCPP_INFO(this->get_logger(), "ADC bit depth: %s", adc_bit_depth_.c_str());
+  }
+
+  void freeImageBuffer(MV_FRAME_OUT & out_frame)
+  {
+    std::lock_guard<std::mutex> lock(sdk_mutex_);
+    int status = MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
+    if (status != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Failed to free image buffer, status = %s",
+        sdkStatusToHex(status).c_str());
+    }
+  }
+
+  bool restartGrabbing()
+  {
+    std::lock_guard<std::mutex> lock(sdk_mutex_);
+    int status = MV_CC_StopGrabbing(camera_handle_);
+    if (status != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Failed to stop grabbing for recovery, status = %s",
+        sdkStatusToHex(status).c_str());
+      return false;
+    }
+    status = MV_CC_StartGrabbing(camera_handle_);
+    if (status != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Failed to restart grabbing for recovery, status = %s",
+        sdkStatusToHex(status).c_str());
+      return false;
+    }
+    return true;
+  }
+
+  const std::map<std::string, std::string> auto_modes_ = {
+    {"Off", "Off"},
+    {"Once", "Once"},
+    {"Continuous", "Continuous"},
+  };
+  const std::map<std::string, std::string> trigger_sources_ = {
+    {"Line0", "Line0"},
+    {"Line1", "Line1"},
+    {"Software", "Software"},
+  };
+  const std::map<std::string, std::string> trigger_activations_ = {
+    {"RisingEdge", "RisingEdge"},
+    {"FallingEdge", "FallingEdge"},
+  };
 
   void * camera_handle_ = nullptr;
   int n_ret_ = MV_OK;
@@ -278,11 +535,28 @@ private:
   std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr params_callback_handle_;
 
+  std::string camera_info_url_;
+  std::string pixel_format_;
+  std::string adc_bit_depth_;
+  bool use_sensor_data_qos_ = true;
   std::string camera_name_;
   std::string frame_id_;
   std::string camera_topic_;
 
+  bool trigger_mode_ = false;
+  std::string trigger_source_;
+  std::string trigger_activation_;
+  double trigger_delay_us_ = 0.0;
+  bool acquisition_frame_rate_enable_ = true;
+  double acquisition_frame_rate_ = 165.0;
+  std::string exposure_auto_;
+  double exposure_time_ = 5000.0;
+  std::string gain_auto_;
+  double gain_ = 15.0;
+
   std::thread capture_thread_;
+  std::atomic_bool running_{true};
+  std::mutex sdk_mutex_;
   int fail_count_ = 0;
 };
 }  // namespace hik_camera_ros2_driver

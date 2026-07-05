@@ -1,13 +1,25 @@
 /hik_camera_ros2_driver:
   ros__parameters:
     camera_info_url: "package://hik_camera_ros2_driver/config/camera_info.yaml"
-    pixel_format: "BayerRG8"        # Recommended Option: "RGB8Packed", "BayerRG8"
-    adc_bit_depth: "Bits_8"         # If using "BayerRG8", <adc_bit_depth> must be set as "Bits_8"; otherwise, it can be "Bits_8" or "Bits_12"
-    use_sensor_data_qos: false
-    camera_name: "left_camera"
-    # frame_id: "optical_frame"     # If not set, it will be set as <camera_name>_optical_frame
-    camera_topic: "left_camera/image"
 
-    acquisition_frame_rate: 200.0   # Unit: Hz
-    exposure_time: 2500             # Unit: us
-    gain: 12.0                      # Range: 0.0 ~ 16.9, Unit: dB
+    # Free-run mode is the default for backward compatibility.
+    trigger_mode: false
+    trigger_source: "Line0"
+    trigger_activation: "RisingEdge"
+    trigger_delay_us: 0.0
+
+    acquisition_frame_rate_enable: true
+    acquisition_frame_rate: 200.0
+
+    exposure_auto: "Off"
+    exposure_time: 5000.0
+
+    gain_auto: "Off"
+    gain: 15.0
+
+    pixel_format: "RGB8Packed"
+    adc_bit_depth: "Bits_8"
+    use_sensor_data_qos: false
+
+    camera_name: "left_camera"
+    camera_topic: "left_camera/image"
