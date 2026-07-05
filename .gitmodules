@@ -1,0 +1,4 @@
+[submodule "tools/FAST-Calib-ROS2"]
+	path = tools/FAST-Calib-ROS2
+	url = https://github.com/Aldoubt/FAST-Calib-ROS2.git
+	branch = dev_humble
