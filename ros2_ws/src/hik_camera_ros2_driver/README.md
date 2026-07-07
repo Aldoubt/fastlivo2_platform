@@ -119,7 +119,7 @@ acquisition_frame_rate: 200.0
 exposure_auto: "Off"
 exposure_time: 5000.0
 gain_auto: "Off"
-gain: 15.0
+gain: 12.0
 ```
 
 In this mode the camera publishes continuously. If `acquisition_frame_rate_enable` is true, `acquisition_frame_rate` is applied to the camera.

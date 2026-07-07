@@ -4,7 +4,7 @@
 
     trigger_mode: true
     trigger_source: "Line0"
-    trigger_activation: "RisingEdge"
+    trigger_activation: "FallingEdge"
     trigger_delay_us: 0.0
 
     # Ignored in trigger mode; the external pulse decides the actual frame rate.
@@ -21,6 +21,7 @@
 
     pixel_format: "RGB8Packed"
     adc_bit_depth: "Bits_8"
+    image_scale: 1.0 
     # FAST-LIVO2 subscribes with default QoS; keep default publisher QoS for compatibility.
     use_sensor_data_qos: false
 

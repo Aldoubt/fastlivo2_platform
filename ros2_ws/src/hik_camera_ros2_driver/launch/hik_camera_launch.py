@@ -23,7 +23,7 @@ def generate_launch_description():
     # Declare the launch arguments
     declare_params_file_cmd = DeclareLaunchArgument(
         "params_file",
-        default_value=os.path.join(bringup_dir, "config", "camera_params.yaml"),
+        default_value=os.path.join(bringup_dir, "config", "fast_livo2_trigger_params.yaml"),
         description="The joystick configuration file path",
     )
 

@@ -1,5 +1,7 @@
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -15,6 +17,7 @@
 #include "MvCameraControl.h"
 #include "camera_info_manager/camera_info_manager.hpp"
 #include "image_transport/image_transport.hpp"
+#include "opencv2/imgproc.hpp"
 #include "rclcpp/logging.hpp"
 #include "rclcpp/utilities.hpp"
 
@@ -136,6 +139,7 @@ private:
     pixel_format_ = this->declare_parameter("pixel_format", "RGB8Packed");
     adc_bit_depth_ = this->declare_parameter("adc_bit_depth", "Bits_8");
     use_sensor_data_qos_ = this->declare_parameter("use_sensor_data_qos", true);
+    image_scale_ = this->declare_parameter("image_scale", 1.0);
     camera_name_ = this->declare_parameter("camera_name", "camera");
     frame_id_ = this->declare_parameter("frame_id", camera_name_ + "_optical_frame");
     camera_topic_ = this->declare_parameter("camera_topic", camera_name_ + "/image");
@@ -161,6 +165,11 @@ private:
     {
       return false;
     }
+    if (image_scale_ <= 0.0 || image_scale_ > 1.0) {
+      RCLCPP_ERROR(this->get_logger(), "image_scale %.3f is outside range (0.0, 1.0]",
+        image_scale_);
+      return false;
+    }
 
     return applyCameraConfiguration();
   }
@@ -169,7 +178,7 @@ private:
   {
     bool ok = true;
 
-    ok = setEnumStringFeature("ADCBitDepth", adc_bit_depth_, true) && ok;
+    setEnumStringFeature("ADCBitDepth", adc_bit_depth_, false);
     ok = setEnumStringFeature("PixelFormat", pixel_format_, true) && ok;
 
     ok = setEnumStringFeature("ExposureAuto", exposure_auto_, true) && ok;
@@ -219,6 +228,7 @@ private:
     if (camera_info_manager_->validateURL(camera_info_url_)) {
       camera_info_manager_->loadCameraInfo(camera_info_url_);
       camera_info_msg_ = camera_info_manager_->getCameraInfo();
+      applyCameraInfoScale();
     } else {
       RCLCPP_WARN(this->get_logger(), "Invalid camera info URL: %s", camera_info_url_.c_str());
     }
@@ -247,15 +257,23 @@ private:
         n_ret_ = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
       }
       if (MV_OK == n_ret_) {
-        image_msg_.height = out_frame.stFrameInfo.nHeight;
-        image_msg_.width = out_frame.stFrameInfo.nWidth;
-        image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
-        image_msg_.data.resize(image_msg_.width * image_msg_.height * 3);
+        const uint32_t src_width = out_frame.stFrameInfo.nWidth;
+        const uint32_t src_height = out_frame.stFrameInfo.nHeight;
+        const uint32_t dst_width = scaledDimension(src_width);
+        const uint32_t dst_height = scaledDimension(src_height);
+        const bool do_resize = dst_width != src_width || dst_height != src_height;
+        std::vector<uint8_t> & convert_buffer = do_resize ? convert_buffer_ : image_msg_.data;
+
+        convert_buffer.resize(src_width * src_height * 3);
+        image_msg_.height = dst_height;
+        image_msg_.width = dst_width;
+        image_msg_.step = dst_width * 3;
+        image_msg_.data.resize(image_msg_.step * image_msg_.height);
 
         convert_param_.nWidth = out_frame.stFrameInfo.nWidth;
         convert_param_.nHeight = out_frame.stFrameInfo.nHeight;
-        convert_param_.pDstBuffer = image_msg_.data.data();
-        convert_param_.nDstBufferSize = image_msg_.data.size();
+        convert_param_.pDstBuffer = convert_buffer.data();
+        convert_param_.nDstBufferSize = convert_buffer.size();
         convert_param_.pSrcData = out_frame.pBufAddr;
         convert_param_.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
         convert_param_.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
@@ -270,6 +288,12 @@ private:
             sdkStatusToHex(convert_status).c_str());
           freeImageBuffer(out_frame);
           continue;
+        }
+
+        if (do_resize) {
+          const cv::Mat src_image(src_height, src_width, CV_8UC3, convert_buffer.data());
+          cv::Mat dst_image(dst_height, dst_width, CV_8UC3, image_msg_.data.data());
+          cv::resize(src_image, dst_image, dst_image.size(), 0.0, 0.0, cv::INTER_LINEAR);
         }
 
         image_msg_.header.stamp = this->now();
@@ -479,6 +503,30 @@ private:
     RCLCPP_INFO(this->get_logger(), "Gain: %.3f", gain_);
     RCLCPP_INFO(this->get_logger(), "Pixel format: %s", pixel_format_.c_str());
     RCLCPP_INFO(this->get_logger(), "ADC bit depth: %s", adc_bit_depth_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Image scale: %.3f", image_scale_);
+  }
+
+  uint32_t scaledDimension(uint32_t value) const
+  {
+    return static_cast<uint32_t>(std::max(1.0, std::round(value * image_scale_)));
+  }
+
+  void applyCameraInfoScale()
+  {
+    if (image_scale_ == 1.0) {
+      return;
+    }
+
+    camera_info_msg_.width = scaledDimension(camera_info_msg_.width);
+    camera_info_msg_.height = scaledDimension(camera_info_msg_.height);
+    camera_info_msg_.k[0] *= image_scale_;
+    camera_info_msg_.k[2] *= image_scale_;
+    camera_info_msg_.k[4] *= image_scale_;
+    camera_info_msg_.k[5] *= image_scale_;
+    camera_info_msg_.p[0] *= image_scale_;
+    camera_info_msg_.p[2] *= image_scale_;
+    camera_info_msg_.p[5] *= image_scale_;
+    camera_info_msg_.p[6] *= image_scale_;
   }
 
   void freeImageBuffer(MV_FRAME_OUT & out_frame)
@@ -539,6 +587,7 @@ private:
   std::string pixel_format_;
   std::string adc_bit_depth_;
   bool use_sensor_data_qos_ = true;
+  double image_scale_ = 1.0;
   std::string camera_name_;
   std::string frame_id_;
   std::string camera_topic_;
@@ -557,6 +606,7 @@ private:
   std::thread capture_thread_;
   std::atomic_bool running_{true};
   std::mutex sdk_mutex_;
+  std::vector<uint8_t> convert_buffer_;
   int fail_count_ = 0;
 };
 }  // namespace hik_camera_ros2_driver
