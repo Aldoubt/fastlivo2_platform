@@ -1,0 +1,42 @@
+/**:
+  ros__parameters:
+    parameter_blackboard.model: Pinhole
+    parameter_blackboard.width: 2448
+    parameter_blackboard.height: 2048
+    parameter_blackboard.scale: 1.0
+
+    parameter_blackboard.fx: 1777.501822
+    parameter_blackboard.fy: 1777.952602
+    parameter_blackboard.cx: 1193.041580
+    parameter_blackboard.cy: 1030.988398
+    parameter_blackboard.d0: -0.085002
+    parameter_blackboard.d1: 0.095734
+    parameter_blackboard.d2: -0.000036
+    parameter_blackboard.d3: -0.000588
+
+    model: Pinhole
+    width: 2448
+    height: 2048
+    scale: 1.0
+
+    fx: 1777.501822
+    fy: 1777.952602
+    cx: 1193.041580
+    cy: 1030.988398
+    d0: -0.085002
+    d1: 0.095734
+    d2: -0.000036
+    d3: -0.000588
+
+    cam_model: Pinhole
+    cam_width: 2448
+    cam_height: 2048
+
+    cam_fx: 1777.501822
+    cam_fy: 1777.952602
+    cam_cx: 1193.041580
+    cam_cy: 1030.988398
+    cam_d0: -0.085002
+    cam_d1: 0.095734
+    cam_d2: -0.000036
+    cam_d3: -0.000588

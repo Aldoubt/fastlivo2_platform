@@ -4,12 +4,49 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import open3d as o3d
 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 from sensor_msgs_py import point_cloud2
+
+
+DEFAULT_BAG_PATH = (
+    Path(__file__).resolve().parent
+    / "FAST-Calib-ROS2/calib_data/2026.07.07"
+)
+
+
+def normalize_bag_path(bag_path: str) -> Path:
+    """允许传 ROS2 bag 目录，也允许直接传 .db3/.mcap 文件。"""
+
+    path = Path(bag_path).expanduser()
+
+    if path.is_file() and path.suffix in (".db3", ".mcap"):
+        return path.parent
+
+    return path
+
+
+def detect_storage_id(bag_path: Path, storage_id: str) -> str:
+    """从 metadata.yaml 自动读取 rosbag2 存储类型。"""
+
+    if storage_id != "auto":
+        return storage_id
+
+    metadata_path = bag_path / "metadata.yaml"
+
+    if not metadata_path.exists():
+        return "sqlite3"
+
+    for line in metadata_path.read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() == "storage_identifier":
+            detected_storage_id = value.strip()
+            if detected_storage_id:
+                return detected_storage_id
+
+    return "sqlite3"
 
 
 def load_pointcloud2_from_bag(
@@ -106,6 +143,14 @@ def select_roi_points(
 ) -> np.ndarray:
     """使用 Open3D 交互选取标定板周围的点。"""
 
+    try:
+        import open3d as o3d
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "缺少 Python 包 open3d，请先安装后再运行："
+            "python3 -m pip install open3d"
+        ) from exc
+
     cloud = o3d.geometry.PointCloud()
     cloud.points = o3d.utility.Vector3dVector(xyz)
 
@@ -172,7 +217,9 @@ def main() -> None:
     parser.add_argument(
         "bag_path",
         type=str,
-        help="ROS2 bag 数据目录",
+        nargs="?",
+        default=str(DEFAULT_BAG_PATH),
+        help=f"ROS2 bag 数据目录，默认：{DEFAULT_BAG_PATH}",
     )
 
     parser.add_argument(
@@ -185,8 +232,8 @@ def main() -> None:
     parser.add_argument(
         "--storage-id",
         type=str,
-        default="sqlite3",
-        choices=("sqlite3", "mcap"),
+        default="auto",
+        choices=("auto", "sqlite3", "mcap"),
         help="rosbag2 存储类型",
     )
 
@@ -213,16 +260,20 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if not Path(args.bag_path).exists():
-        raise FileNotFoundError(f"bag 路径不存在：{args.bag_path}")
+    bag_path = normalize_bag_path(args.bag_path)
+
+    if not bag_path.exists():
+        raise FileNotFoundError(f"bag 路径不存在：{bag_path}")
+
+    storage_id = detect_storage_id(bag_path, args.storage_id)
 
     if args.frame_stride < 1:
         raise ValueError("frame_stride 必须大于等于 1")
 
     xyz = load_pointcloud2_from_bag(
-        bag_path=args.bag_path,
+        bag_path=str(bag_path),
         topic_name=args.topic,
-        storage_id=args.storage_id,
+        storage_id=storage_id,
         frame_stride=args.frame_stride,
     )
 
@@ -243,4 +294,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
