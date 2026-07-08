@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -16,9 +17,13 @@
 
 #include "MvCameraControl.h"
 #include "camera_info_manager/camera_info_manager.hpp"
+#include "hik_camera_ros2_driver/livox_timestamp_synchronizer.hpp"
 #include "image_transport/image_transport.hpp"
+#include "livox_ros_driver2/msg/custom_msg.hpp"
 #include "opencv2/imgproc.hpp"
 #include "rclcpp/logging.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp/qos.hpp"
 #include "rclcpp/utilities.hpp"
 
 namespace hik_camera_ros2_driver
@@ -30,6 +35,17 @@ std::string sdkStatusToHex(int status)
   std::ostringstream stream;
   stream << "0x" << std::hex << std::uppercase << static_cast<uint32_t>(status);
   return stream.str();
+}
+
+int64_t steadyNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+int64_t stampToNs(const builtin_interfaces::msg::Time & stamp)
+{
+  return static_cast<int64_t>(stamp.sec) * 1000000000LL + static_cast<int64_t>(stamp.nanosec);
 }
 }  // namespace
 
@@ -56,6 +72,9 @@ public:
   ~HikCameraRos2DriverNode() override
   {
     running_ = false;
+    if (livox_synchronizer_) {
+      livox_synchronizer_->shutdown();
+    }
     if (capture_thread_.joinable()) {
       capture_thread_.join();
     }
@@ -148,6 +167,13 @@ private:
     trigger_source_ = this->declare_parameter("trigger_source", "Line0");
     trigger_activation_ = this->declare_parameter("trigger_activation", "RisingEdge");
     trigger_delay_us_ = this->declare_parameter("trigger_delay_us", 0.0);
+    timestamp_source_ = this->declare_parameter("timestamp_source", "ros_now");
+    livox_topic_ = this->declare_parameter("livox_topic", "/livox/lidar");
+    sync_queue_size_ = static_cast<std::size_t>(
+      this->declare_parameter("sync_queue_size", 30));
+    sync_wait_timeout_ms_ = this->declare_parameter("sync_wait_timeout_ms", 80);
+    max_pairing_host_delta_ms_ = this->declare_parameter("max_pairing_host_delta_ms", 50.0);
+    timestamp_diagnostics_ = this->declare_parameter("timestamp_diagnostics", true);
 
     acquisition_frame_rate_enable_ =
       this->declare_parameter("acquisition_frame_rate_enable", true);
@@ -170,8 +196,45 @@ private:
         image_scale_);
       return false;
     }
+    if (!validateTimestampParameters()) {
+      return false;
+    }
 
     return applyCameraConfiguration();
+  }
+
+  bool validateTimestampParameters()
+  {
+    if (timestamp_source_ == "ros_now") {
+      timestamp_source_mode_ = TimestampSourceMode::RosNow;
+    } else if (timestamp_source_ == "livox_timebase") {
+      timestamp_source_mode_ = TimestampSourceMode::LivoxTimebase;
+    } else {
+      RCLCPP_ERROR(this->get_logger(), "Invalid timestamp_source value '%s'",
+        timestamp_source_.c_str());
+      return false;
+    }
+
+    if (timestamp_source_mode_ == TimestampSourceMode::LivoxTimebase && !trigger_mode_) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "timestamp_source=livox_timebase requires trigger_mode=true");
+      return false;
+    }
+    if (sync_queue_size_ == 0) {
+      RCLCPP_ERROR(this->get_logger(), "sync_queue_size must be positive");
+      return false;
+    }
+    if (sync_wait_timeout_ms_ <= 0) {
+      RCLCPP_ERROR(this->get_logger(), "sync_wait_timeout_ms must be positive");
+      return false;
+    }
+    if (max_pairing_host_delta_ms_ <= 0.0) {
+      RCLCPP_ERROR(this->get_logger(), "max_pairing_host_delta_ms must be positive");
+      return false;
+    }
+
+    return true;
   }
 
   bool applyCameraConfiguration()
@@ -222,6 +285,19 @@ private:
   {
     auto qos = use_sensor_data_qos_ ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
     camera_pub_ = image_transport::create_camera_publisher(this, camera_topic_, qos);
+    if (timestamp_source_mode_ == TimestampSourceMode::LivoxTimebase) {
+      LivoxTimestampSynchronizerConfig config;
+      config.queue_size = sync_queue_size_;
+      config.wait_timeout_ns = sync_wait_timeout_ms_ * 1000000LL;
+      config.max_pairing_host_delta_ns =
+        static_cast<int64_t>(max_pairing_host_delta_ms_ * 1000000.0);
+      livox_synchronizer_.reset(new LivoxTimestampSynchronizer(config));
+
+      livox_sub_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+        livox_topic_,
+        rclcpp::SensorDataQoS(),
+        std::bind(&HikCameraRos2DriverNode::livoxCallback, this, std::placeholders::_1));
+    }
 
     camera_info_manager_ =
       std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
@@ -256,7 +332,15 @@ private:
         std::lock_guard<std::mutex> lock(sdk_mutex_);
         n_ret_ = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
       }
+      const int64_t image_host_steady_ns = steadyNowNs();
       if (MV_OK == n_ret_) {
+        rclcpp::Time image_stamp;
+        LivoxPairingResult pairing_result;
+        if (!resolveImageTimestamp(out_frame, image_host_steady_ns, image_stamp, pairing_result)) {
+          freeImageBuffer(out_frame);
+          continue;
+        }
+
         const uint32_t src_width = out_frame.stFrameInfo.nWidth;
         const uint32_t src_height = out_frame.stFrameInfo.nHeight;
         const uint32_t dst_width = scaledDimension(src_width);
@@ -296,10 +380,11 @@ private:
           cv::resize(src_image, dst_image, dst_image.size(), 0.0, 0.0, cv::INTER_LINEAR);
         }
 
-        image_msg_.header.stamp = this->now();
+        image_msg_.header.stamp = image_stamp;
         camera_info_msg_.header = image_msg_.header;
         camera_pub_.publish(image_msg_, camera_info_msg_);
         fail_count_ = 0;
+        logTimestampDiagnostics(out_frame, pairing_result, false);
 
         freeImageBuffer(out_frame);
 
@@ -339,6 +424,58 @@ private:
         RCLCPP_FATAL(this->get_logger(), "Camera failed!");
         rclcpp::shutdown();
       }
+    }
+  }
+
+  bool resolveImageTimestamp(
+    const MV_FRAME_OUT & out_frame,
+    int64_t image_host_steady_ns,
+    rclcpp::Time & image_stamp,
+    LivoxPairingResult & pairing_result)
+  {
+    if (timestamp_source_mode_ == TimestampSourceMode::RosNow) {
+      image_stamp = this->now();
+      return true;
+    }
+
+    pairing_result = livox_synchronizer_->matchImage(image_host_steady_ns);
+    if (!pairing_result.matched) {
+      logTimestampDiagnostics(out_frame, pairing_result, true);
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 3000,
+        "Dropping camera frame %u because no compatible Livox timebase was available",
+        out_frame.stFrameInfo.nFrameNum);
+      return false;
+    }
+
+    image_stamp = rclcpp::Time(pairing_result.sample.stamp_ns);
+    return true;
+  }
+
+  void livoxCallback(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg)
+  {
+    if (msg->timebase == 0 ||
+      msg->timebase > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    {
+      if (livox_synchronizer_) {
+        livox_synchronizer_->addSample(0, 0, steadyNowNs());
+      }
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 3000,
+        "Rejected invalid Livox timebase: %llu",
+        static_cast<unsigned long long>(msg->timebase));
+      return;
+    }
+
+    const int64_t stamp_ns = static_cast<int64_t>(msg->timebase);
+    const int64_t header_stamp_ns = stampToNs(msg->header.stamp);
+    const bool accepted = livox_synchronizer_->addSample(
+      stamp_ns, header_stamp_ns, steadyNowNs());
+    if (!accepted) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 3000,
+        "Rejected Livox timestamp sample: timebase=%ld header=%ld",
+        stamp_ns, header_stamp_ns);
     }
   }
 
@@ -491,6 +628,12 @@ private:
   {
     RCLCPP_INFO(this->get_logger(), "Camera acquisition mode: %s",
       trigger_mode_ ? "ExternalTrigger" : "FreeRun");
+    RCLCPP_INFO(this->get_logger(), "Timestamp source: %s", timestamp_source_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Livox topic: %s", livox_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(), "Sync queue size: %zu", sync_queue_size_);
+    RCLCPP_INFO(this->get_logger(), "Sync wait timeout: %ld ms", sync_wait_timeout_ms_);
+    RCLCPP_INFO(this->get_logger(), "Max pairing host delta: %.3f ms",
+      max_pairing_host_delta_ms_);
     RCLCPP_INFO(this->get_logger(), "Trigger source: %s", trigger_source_.c_str());
     RCLCPP_INFO(this->get_logger(), "Trigger activation: %s", trigger_activation_.c_str());
     RCLCPP_INFO(this->get_logger(), "Trigger delay: %.3f us", trigger_delay_us_);
@@ -504,6 +647,53 @@ private:
     RCLCPP_INFO(this->get_logger(), "Pixel format: %s", pixel_format_.c_str());
     RCLCPP_INFO(this->get_logger(), "ADC bit depth: %s", adc_bit_depth_.c_str());
     RCLCPP_INFO(this->get_logger(), "Image scale: %.3f", image_scale_);
+  }
+
+  void logTimestampDiagnostics(
+    const MV_FRAME_OUT & out_frame,
+    const LivoxPairingResult & pairing_result,
+    bool dropped)
+  {
+    if (!timestamp_diagnostics_ ||
+      timestamp_source_mode_ != TimestampSourceMode::LivoxTimebase ||
+      !livox_synchronizer_)
+    {
+      return;
+    }
+
+    const int64_t now_ns = steadyNowNs();
+    if (!dropped && now_ns - last_timestamp_diag_ns_ < 3000000000LL) {
+      return;
+    }
+    if (dropped && now_ns - last_timestamp_warn_ns_ < 3000000000LL) {
+      return;
+    }
+    if (dropped) {
+      last_timestamp_warn_ns_ = now_ns;
+    } else {
+      last_timestamp_diag_ns_ = now_ns;
+    }
+
+    const auto stats = livox_synchronizer_->stats();
+    const double host_delta_ms = pairing_result.host_delta_ns / 1000000.0;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "timestamp diagnostics: frame=%u trigger=%u matched=%s livox=%ld "
+      "host_delta=%.3fms queue=%zu matched_count=%llu dropped=%llu invalid=%llu "
+      "duplicate=%llu rollback=%llu header_mismatch=%llu abnormal_interval=%llu",
+      out_frame.stFrameInfo.nFrameNum,
+      out_frame.stFrameInfo.nTriggerIndex,
+      pairing_result.matched ? "true" : "false",
+      pairing_result.sample.stamp_ns,
+      host_delta_ms,
+      pairing_result.queue_size,
+      static_cast<unsigned long long>(stats.matched_frames),
+      static_cast<unsigned long long>(stats.dropped_unsynced_frames),
+      static_cast<unsigned long long>(stats.invalid_livox_stamps),
+      static_cast<unsigned long long>(stats.duplicate_livox_stamps),
+      static_cast<unsigned long long>(stats.rollback_livox_stamps),
+      static_cast<unsigned long long>(stats.header_mismatch_stamps),
+      static_cast<unsigned long long>(stats.abnormal_interval_stamps));
   }
 
   uint32_t scaledDimension(uint32_t value) const
@@ -571,6 +761,11 @@ private:
     {"RisingEdge", "RisingEdge"},
     {"FallingEdge", "FallingEdge"},
   };
+  enum class TimestampSourceMode
+  {
+    RosNow,
+    LivoxTimebase,
+  };
 
   void * camera_handle_ = nullptr;
   int n_ret_ = MV_OK;
@@ -596,6 +791,13 @@ private:
   std::string trigger_source_;
   std::string trigger_activation_;
   double trigger_delay_us_ = 0.0;
+  std::string timestamp_source_ = "ros_now";
+  TimestampSourceMode timestamp_source_mode_ = TimestampSourceMode::RosNow;
+  std::string livox_topic_ = "/livox/lidar";
+  std::size_t sync_queue_size_ = 30;
+  int64_t sync_wait_timeout_ms_ = 80;
+  double max_pairing_host_delta_ms_ = 50.0;
+  bool timestamp_diagnostics_ = true;
   bool acquisition_frame_rate_enable_ = true;
   double acquisition_frame_rate_ = 165.0;
   std::string exposure_auto_;
@@ -607,6 +809,10 @@ private:
   std::atomic_bool running_{true};
   std::mutex sdk_mutex_;
   std::vector<uint8_t> convert_buffer_;
+  std::unique_ptr<LivoxTimestampSynchronizer> livox_synchronizer_;
+  rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr livox_sub_;
+  int64_t last_timestamp_diag_ns_ = 0;
+  int64_t last_timestamp_warn_ns_ = 0;
   int fail_count_ = 0;
 };
 }  // namespace hik_camera_ros2_driver

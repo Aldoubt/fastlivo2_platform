@@ -7,6 +7,12 @@
     trigger_source: "Line0"
     trigger_activation: "RisingEdge"
     trigger_delay_us: 0.0
+    timestamp_source: "ros_now"
+    livox_topic: "/livox/lidar"
+    sync_queue_size: 30
+    sync_wait_timeout_ms: 80
+    max_pairing_host_delta_ms: 50.0
+    timestamp_diagnostics: true
 
     acquisition_frame_rate_enable: true
     acquisition_frame_rate: 200.0

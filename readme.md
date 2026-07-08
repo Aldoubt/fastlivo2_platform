@@ -120,6 +120,8 @@ ros2 launch hik_camera_ros2_driver hik_camera_launch.py \
   params_file:=/home/jetson/fastlivo2_platform/ros2_ws/src/hik_camera_ros2_driver/config/fast_livo2_trigger_params.yaml
 ```
 
+这个配置会启用 `timestamp_source: livox_timebase`。相机每收到一帧硬触发图像后，会等待最近一次 `/livox/lidar` 的 `livox_ros_driver2/msg/CustomMsg.timebase`，并把 `/left_camera/image.header.stamp` 改成同一个 Livox 时间基；匹配失败时直接丢帧，不回退到主机时间。普通 `camera_params.yaml` 仍使用 `timestamp_source: ros_now`，适合自由运行调试。
+
 ### 终端 3：启动 FAST-LIVO2 算法
 
 启动算法和 RViz：
@@ -142,6 +144,14 @@ FAST-LIVO2 默认订阅：
 - `/livox/lidar`
 - `/livox/imu`
 - `/left_camera/image`
+
+也可以用本仓库的一键启动文件同时启动 MID360、海康相机和 FAST-LIVO2：
+
+```bash
+ros2 launch fastlivo2_bringup mid360_hik_fastlivo2.launch.py use_rviz:=False
+```
+
+该启动文件会强制 Livox 使用 `xfer_format=1` 输出 `CustomMsg`，相机使用 `fast_livo2_trigger_params.yaml`，FAST-LIVO2 使用 `mid360_hik.yaml` 和 `camera_mid360_hik.yaml`。
 
 ## 5. 常用检查命令
 
@@ -175,3 +185,11 @@ ros2 topic hz /left_camera/image
 ```bash
 ros2 node list | grep laserMapping
 ```
+
+检查在线时间戳是否在同一时间基：
+
+```bash
+python3 tools/check_livo_time.py
+```
+
+重点看输出中的 `header-timebase`、`img-lidar_timebase` 和 `imu-lidar_timebase`。正常情况下，Livox 的 `header-timebase` 应接近 0；硬触发 FAST-LIVO2 模式下，相机 `img-lidar_timebase` 应在毫秒级触发/接收抖动范围内，而不应该再出现相机是当前系统时间、IMU 或雷达落到 2020 年这种跨时间基现象。

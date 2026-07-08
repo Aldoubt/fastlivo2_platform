@@ -6,6 +6,12 @@
     trigger_source: "Line0"
     trigger_activation: "FallingEdge"
     trigger_delay_us: 0.0
+    timestamp_source: "livox_timebase"
+    livox_topic: "/livox/lidar"
+    sync_queue_size: 30
+    sync_wait_timeout_ms: 80
+    max_pairing_host_delta_ms: 50.0
+    timestamp_diagnostics: true
 
     # Ignored in trigger mode; the external pulse decides the actual frame rate.
     acquisition_frame_rate_enable: false

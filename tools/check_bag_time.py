@@ -82,7 +82,13 @@ def summarize(name, deltas):
     )
 
 
-def read_header_stamps(bag_uri, topics):
+def format_range(values):
+    if not values:
+        return '0 samples'
+    return f'{len(values)} samples, {values[0]:.6f} -> {values[-1]:.6f}'
+
+
+def read_topic_times(bag_uri, topics):
     bag_uri = resolve_bag_uri(Path(bag_uri))
     reader = rosbag2_py.SequentialReader()
     storage_options = rosbag2_py.StorageOptions(uri=str(bag_uri), storage_id='sqlite3')
@@ -106,21 +112,30 @@ def read_header_stamps(bag_uri, topics):
     message_types = {
         topic: get_message(topic_types[topic]) for topic in topics.values()
     }
-    stamps = {key: [] for key in topics}
+    times = {
+        key: {
+            'header': [],
+            'bag': [],
+        }
+        for key in topics
+    }
 
     while reader.has_next():
-        topic, data, _ = reader.read_next()
+        topic, data, bag_timestamp_ns = reader.read_next()
         for key, expected_topic in topics.items():
             if topic != expected_topic:
                 continue
             msg = deserialize_message(data, message_types[topic])
-            stamps[key].append(stamp_to_sec(msg.header.stamp))
+            times[key]['bag'].append(bag_timestamp_ns * 1e-9)
+            if hasattr(msg, 'header'):
+                times[key]['header'].append(stamp_to_sec(msg.header.stamp))
             break
 
-    for values in stamps.values():
-        values.sort()
+    for topic_times in times.values():
+        topic_times['header'].sort()
+        topic_times['bag'].sort()
 
-    return stamps
+    return times
 
 
 def main():
@@ -144,30 +159,57 @@ def main():
         'image': args.image_topic,
     }
 
-    stamps = read_header_stamps(args.bag, topics)
+    times = read_topic_times(args.bag, topics)
 
-    print('Topic sample counts:')
+    print('Topic sample counts using header.stamp:')
     for key, topic in topics.items():
-        values = stamps[key]
-        if values:
-            print(f'  {topic}: {len(values)} samples, {values[0]:.6f} -> {values[-1]:.6f}')
-        else:
-            print(f'  {topic}: 0 samples')
+        print(f"  {topic}: {format_range(times[key]['header'])}")
+
+    print()
+    print('Topic sample counts using rosbag record timestamp:')
+    for key, topic in topics.items():
+        print(f"  {topic}: {format_range(times[key]['bag'])}")
+
+    print()
+    print('Per-topic header.stamp - rosbag record timestamp:')
+    for key, topic in topics.items():
+        header_times = times[key]['header']
+        bag_times = times[key]['bag']
+        if not header_times or not bag_times:
+            print(f'  {topic}: no comparable samples')
+            continue
+        deltas = [header - bag for header, bag in zip(header_times, bag_times)]
+        print('  ' + summarize(topic, deltas))
 
     img_lidar = []
     img_imu = []
-    for img_stamp in stamps['image']:
-        lidar_delta = nearest_delta(img_stamp, stamps['lidar'])
-        imu_delta = nearest_delta(img_stamp, stamps['imu'])
+    for img_stamp in times['image']['header']:
+        lidar_delta = nearest_delta(img_stamp, times['lidar']['header'])
+        imu_delta = nearest_delta(img_stamp, times['imu']['header'])
         if lidar_delta is not None:
             img_lidar.append(img_stamp - (img_stamp + lidar_delta))
         if imu_delta is not None:
             img_imu.append(img_stamp - (img_stamp + imu_delta))
 
     print()
-    print('Nearest-neighbor timestamp deltas using each image frame as reference:')
+    print('Nearest-neighbor header.stamp deltas using each image frame as reference:')
     print(summarize('img - nearest_lidar', img_lidar))
     print(summarize('img - nearest_imu', img_imu))
+
+    img_lidar_bag = []
+    img_imu_bag = []
+    for img_stamp in times['image']['bag']:
+        lidar_delta = nearest_delta(img_stamp, times['lidar']['bag'])
+        imu_delta = nearest_delta(img_stamp, times['imu']['bag'])
+        if lidar_delta is not None:
+            img_lidar_bag.append(img_stamp - (img_stamp + lidar_delta))
+        if imu_delta is not None:
+            img_imu_bag.append(img_stamp - (img_stamp + imu_delta))
+
+    print()
+    print('Nearest-neighbor rosbag record timestamp deltas using each image frame as reference:')
+    print(summarize('img - nearest_lidar', img_lidar_bag))
+    print(summarize('img - nearest_imu', img_imu_bag))
 
 
 if __name__ == '__main__':

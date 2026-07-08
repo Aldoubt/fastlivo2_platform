@@ -18,6 +18,7 @@ find_package(OpenCV REQUIRED)
 
 ament_auto_add_library(${PROJECT_NAME} SHARED
   src/hik_camera_node.cpp
+  src/livox_timestamp_synchronizer.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PUBLIC hikSDK/include)
@@ -53,7 +54,13 @@ rclcpp_components_register_node(${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
+  ament_add_gtest(test_livox_timestamp_synchronizer
+    test/test_livox_timestamp_synchronizer.cpp
+    src/livox_timestamp_synchronizer.cpp
+  )
+  target_include_directories(test_livox_timestamp_synchronizer PRIVATE include)
   list(APPEND AMENT_LINT_AUTO_EXCLUDE
     ament_cmake_copyright
     ament_cmake_cpplint
